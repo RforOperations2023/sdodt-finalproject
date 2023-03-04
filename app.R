@@ -1,3 +1,4 @@
+## Author: Sebastian Dodt
 library(shiny)
 library(shinydashboard)
 library(dplyr)
@@ -8,9 +9,18 @@ library(plotly)
 library(ggthemes)
 library(countrycode)
 library(formattable)
+library(httr)
+library(leaflet)
+library(dotenv)
 
 
-# load("combined.Rdata")
+# static variables
+background_color <- "white"
+load_dot_env(".env")
+api_key <- Sys.getenv("api_key")
+
+
+# loading files
 load("data/ship_ids.Rdata")
 transshipments <- readRDS("data/dataset.RDS")
 port_visits <- readRDS("data/port.RDS")
@@ -18,7 +28,37 @@ subtitle_text <- readRDS("data/subtitle.RDS")
 flag_choices <- readRDS("data/flags.RDS")
 sv <- read.csv("data/current_location.csv")
 
-background_color <- "white"
+
+# The following call has been shortened in loading time
+# by pre-filtering the needed boarders in data_processing.R
+# all_eez <- sf::st_read("data/World_EEZ_v11_20191118/eez_v11.shp")
+us_eez_shp <- readRDS("data/shapefiles_for_us_eez.RDS") 
+
+
+# pre-processing for home tab
+worst_offenders <- transshipments %>%
+  group_by(vessel.mmsi) %>%
+  summarise(number_of_meetings = n_distinct(id)) %>%
+  mutate(percentile = percent_rank(number_of_meetings)) %>%
+  select(vessel.mmsi, percentile, number_of_meetings)
+suspicion_low <- worst_offenders %>%
+  pull(vessel.mmsi)
+suspicion_medium <- worst_offenders %>%
+  filter(percentile >= 0.5) %>%
+  pull(vessel.mmsi)
+suspicion_high <- worst_offenders %>%
+  filter(percentile >= 0.9) %>%
+  pull(vessel.mmsi)
+
+# pre-processing for reefer search tab
+recently_updated <- sv %>%
+  mutate(last_transmission = as.Date(
+    substr(sv$Time.of.Fix..formatted., 2, 11), format = "%Y-%m-%d")
+  ) %>%
+  filter(last_transmission > as.Date("2023-02-01")) %>%
+  pull(MMSI)
+ship_mmsi_recent <- ship_mmsi[ship_mmsi %in% recently_updated]
+ship_mmsi_recent <- ship_mmsi_recent[ship_mmsi_recent %in% suspicion_high]
 
 ## NATO
 nato_countries <- read.csv(file = "data/nato_countries.csv")
@@ -42,11 +82,12 @@ get_most_frequent_value <- function(df, column_name) {
     pull(!!as.name(column_name)))
 }
 
-
+# Header
 header <- dashboardHeader(
   title = "Reefer Tracking Portal"
 )
 
+# Sidebar
 sidebar <- dashboardSidebar(
   sidebarMenu(
     id = "tabs",
@@ -93,8 +134,11 @@ sidebar <- dashboardSidebar(
   )
 )
 
+# Body
 body <- dashboardBody(
   tabItems(
+
+    # TAB 1: HOME
     tabItem(
       "home",
       h3("Introduction"),
@@ -103,9 +147,22 @@ body <- dashboardBody(
           width = 6,
           align = "left",
           p(subtitle_text)
+        ),
+        column(
+          width = 6,
+          radioButtons(
+            "intro_map_filter",
+            "Level of suspicious behaviour (at least)",
+            choices = c("Low", "Medium", "High"),
+            selected = "Low",
+            inline = TRUE
+          ),
+          leafletOutput("intro_map")
         )
       )
     ),
+
+    # TAB 2: RANKING
     tabItem(
       "ranking",
       h3("Vulnerability to enforcement"),
@@ -155,6 +212,8 @@ body <- dashboardBody(
         )
       )
     ),
+
+    # TAB 3: REEFER SEARCH
     tabItem(
       "plot",
       fluidRow(
@@ -163,10 +222,10 @@ body <- dashboardBody(
           selectInput(
             "vessel_mmsi",
             "Support Vessel MMSI number",
-            choices = ship_mmsi,
+            choices = ship_mmsi_recent,
             multiple = FALSE,
             selectize = TRUE,
-            selected = 371717000)
+            selected = 273354740)
         ),
         column(
           width = 6,
@@ -178,7 +237,10 @@ body <- dashboardBody(
           htmlOutput("vessel_flag"))
       ),
       fluidRow(
-        column(width = 3),
+        column(
+          width = 3,
+          downloadButton("download_data", "Download meeting data"),
+        ),
         column(
           width = 6,
           uiOutput("description")
@@ -187,7 +249,9 @@ body <- dashboardBody(
       ),
       hr(),
       h4("Activity"),
-      plotlyOutput(outputId = "history"),
+      p("This map shows the 90-day history of the selected vessel."),
+      p("Zick-zags in the lines indicate illegal meetings with fishing vessels"),
+      leafletOutput("history"),
       hr(),
       h4("Distance from shore during meetings"),
       plotlyOutput("distplot"),
@@ -211,21 +275,77 @@ body <- dashboardBody(
       plotlyOutput("portplotcountry")
     )
   ),
-  tags$head(tags$style("#history{height:220px !important;}")),
   tags$head(tags$style(HTML('
-                                /* logo */
-                                .content-wrapper {
-                                background-color: #ffffff;
-                                }')))
+    /* logo */
+    .content-wrapper {
+    background-color: #ffffff;
+    }')))
 )
 
 ui <- dashboardPage(header, sidebar, body, title = "Illegal Fishing")
 
 
 
-server <- function(input, output) {
+server <- function(input, output, session) {
 
-  ## RANKING TAB
+  ## TAB 1: HOME
+
+  # Intro Cluster Map of locations
+  output$intro_map <- renderLeaflet({
+    leaflet() %>%
+      addTiles()  %>%
+      addMarkers(
+        data = vessel_layer_data(),
+        ~Longitude,
+        ~Latitude,
+        popup = ~MMSI,
+        clusterOptions = markerClusterOptions(),
+        label = ~Label,
+        group = "vessels") %>%
+      addPolygons(
+        data=us_eez_shp,
+        fillColor="red",
+        stroke=FALSE) %>%
+        setView(lng = -98.35, lat = 39.5, zoom = 2)
+  })
+
+  # Function to return current position of filtered vessels
+  vessel_layer_data <- reactive({
+    req(input$intro_map_filter)
+    location_data <- sv %>%
+      mutate(Destination_filled = if_else(
+        is.na(Destination),
+        "unknown",
+        if_else(Destination == "",
+        "unknown",
+        Destination))) %>%
+      mutate(Label = paste0(
+        "Name: ", Name, ", \nFlag: ", Flag, ", \nDestination: ", Destination_filled
+      ))
+    if(input$intro_map_filter == "Low") {
+      return(location_data %>% filter(MMSI %in% suspicion_low))
+    } else if(input$intro_map_filter == "Medium") {
+      return(location_data %>% filter(MMSI %in% suspicion_medium))
+    } else return(location_data %>% filter(MMSI %in% suspicion_high))
+   })
+
+  # updating cluster map when level of suspiciousness changes
+  observe({
+    proxy <- leafletProxy("intro_map", session = session)
+    proxy %>% clearGroup("vessels")
+    df <- vessel_layer_data()
+    proxy %>% addMarkers(
+      data = df,
+      ~Longitude,
+      ~Latitude,
+      popup = ~MMSI,
+      clusterOptions = markerClusterOptions(),
+      label = ~Label,
+      group = "vessels")
+  })
+
+
+  ## TAB 2: RANKING
 
   generate_rankings2 <- reactive({
     all_meetings <- transshipments %>%
@@ -309,8 +429,11 @@ server <- function(input, output) {
   })
 
 
+  # Reactively highlighting value boxes based on last button click
   rv <- reactiveValues(table_shown = "none")
 
+  # Value Box 1: Flag
+  ## data getter
   flag_data <- reactive({
     df <- generate_rankings2() %>%
       select(
@@ -332,6 +455,7 @@ server <- function(input, output) {
       )
   })
 
+  ## rendering
   output$flag <- renderValueBox({
     num <- flag_data() %>%
       nrow()
@@ -350,6 +474,7 @@ server <- function(input, output) {
     }
   })
 
+  ## observer
   observeEvent(
     eventExpr = input$show_flag,
     handlerExpr = {
@@ -366,6 +491,8 @@ server <- function(input, output) {
     }
   )
 
+  # Value Box 2: EEZ
+  ## data getter
   eez_data <- reactive({
     df <- generate_rankings2() %>%
       select(
@@ -388,6 +515,7 @@ server <- function(input, output) {
       )
   })
 
+  ## rendering
   output$eez <- renderValueBox({
     num <- eez_data() %>%
       nrow()
@@ -413,6 +541,7 @@ server <- function(input, output) {
     }
   })
 
+  ## observer
   observeEvent(
     eventExpr = input$show_eez,
     handlerExpr = {
@@ -471,9 +600,11 @@ server <- function(input, output) {
   #   }
   # )
 
+  # Value Box 4: Port
+  ## data getter
   port_data <- reactive({
     generate_rankings2() %>%
-      select(
+      dplyr::select(
         "Flag",
         "Vessel Name",
         "Longitude",
@@ -495,6 +626,7 @@ server <- function(input, output) {
       )
   })
 
+  ## rendering
   output$port <- renderValueBox({
     num <- port_data() %>%
       nrow()
@@ -518,6 +650,7 @@ server <- function(input, output) {
     }
   })
 
+  ## observer
   observeEvent(
     eventExpr = input$show_port,
     handlerExpr = {
@@ -530,17 +663,12 @@ server <- function(input, output) {
           as.datatable(escape = FALSE,
                       options = list(scrollX = TRUE),
                       rownames = FALSE))
-      #   DT::datatable(
-      #     data = port_data(),
-      #     options = list(pageLength = 10),
-      #     rownames = FALSE)
-      # )
       rv$table_shown <- "port"
     }
   )
 
 
-  ## PLOT TAB
+  ## TAB 3: REEFER SEARCH
 
   # general function to get meeting data for one vessel
   mmsi_data <- reactive({
@@ -616,6 +744,7 @@ server <- function(input, output) {
             )
           )
         ),
+        # generating a description for each meeting
         event_description = paste0(
               "<b>", Event, "</b><br>",
               ifelse(
@@ -639,7 +768,7 @@ server <- function(input, output) {
       )
   })
 
-  # header and description
+  # generating descriptive values for each vessel
   description_values <- reactive({
     mmsi_meetings <- mmsi_data()
     desc <- list()
@@ -662,6 +791,7 @@ server <- function(input, output) {
     desc
   })
 
+  # generating description
   description_text <- reactive({
     description <- description_values()
     HTML(
@@ -676,56 +806,41 @@ server <- function(input, output) {
       ))
     })
 
+  # rendering header
   output$vessel_name <- renderText(
     description_values()$vessel_name
   )
 
+  # rendering flag icon
   output$vessel_flag <- renderUI(
     shinyflags::flag(
       country = countrycode(description_values()$vessel_flag, "iso3c", "iso2c")
     ))
 
+  # rendering description
   output$description <- renderUI({
     description_text()
   })
 
-
-  # plot timeline graph
-  output$history <- plotly::renderPlotly({
-    df <- mmsi_with_port()
-    ggplotly(
-      p = ggplot(
-        df,
-        aes(
-          xmin = start,
-          xmax = end,
-          ymin = 1,
-          ymax = 2,
-          fill = Event,
-          hovertext = event_description
-        )) +
-        geom_rect() +
-        theme_wsj() +
-        theme(
-          legend.position = "right",
-          legend.background = element_rect(fill = background_color),
-          plot.background = element_rect(fill = background_color),
-          panel.background = element_rect(fill = background_color),
-          panel.grid.major = element_blank(),
-          panel.grid.minor = element_blank(),
-          axis.ticks.y = element_blank(),
-          axis.text.y = element_blank()) +
-        scale_fill_manual(
-          name = "",
-          values = c(
-            "dark meeting" = "#D95F02",
-            "tracked meeting" = "#7570B3",
-            "at port" = "lightgrey"))
-      ,
-      tooltip = df$event_description
-    )
+  # API Call to get 90-day history
+  vessel_history <- reactive({
+    age <- 90
+    vessel_history_url <- paste0('https://api.seavision.volpe.dot.gov/v1/vessels/', input$vessel_mmsi, '/history')
+    headers <- c('accept' = 'application/json', 'x-api-key' = api_key)
+    params <- list('age' = age)
+    response <- httr::GET(url = vessel_history_url, query = params, add_headers(.headers=headers))
+    result <- jsonlite::fromJSON(httr::content(response, as = "text"))
+    return(result)
   })
 
+  # plot timeline map
+  output$history <- renderLeaflet({
+  leaflet() %>%
+    addTiles() %>%
+    addPolylines(data = vessel_history(), lng = ~longitude, lat = ~latitude)
+  })
+
+  # plot distribution plot for distance from shore
   output$distplot <- plotly::renderPlotly({
     df <- mmsi_data()
     ggplotly(
@@ -773,6 +888,7 @@ server <- function(input, output) {
     )
   })
 
+  # plot bar plot for ports
   port_plot <- reactive({
     df <- mmsi_data()
     if (input$city_or_country == "Country") {
@@ -826,10 +942,19 @@ server <- function(input, output) {
       tooltip = "text"
     )
   })
-
   output$portplotcountry <- renderPlotly({
     port_plot()
   })
+
+  # download button
+  output$download_data <- downloadHandler(
+  filename = function() {
+    paste("meeting_of_", input$vessel_mmsi, ".csv", sep = "")
+  },
+  content = function(file) {
+    write.csv(mmsi_data(), file)
+  }
+)
 }
 
 # Run the application ----------------------------------------------
