@@ -38,3 +38,14 @@ vignettes/*.pdf
 # R Environment Variables
 .Renviron
 .env
+
+# files to ignore
+data/encounter.csv
+data/current_location_old.csv
+data/World_EEZ_v11_20191118
+data/lists-Reefers-2022-11-11_04-40.csv
+data/lists-Reefers-2023-03-03_06-54.csv
+data/loitering.csv
+data/port.csv
+data/shapefiles_for_all_nato_countries.RDS
+.DS_Store
