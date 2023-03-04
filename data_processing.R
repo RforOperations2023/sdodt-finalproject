@@ -1,11 +1,6 @@
 library(qdapTools)
 
-# load("combined.Rdata")
-# df <- rbind(loitering, encounter)
-# df <- cbind(df, mtabulate(strsplit(df$regions.rfmo, "[|]")))
-# saveRDS(df, file = "dataset.RDS")
-
-
+# Saving meeting and port data as RDS file so that they read in faster
 encounter <- read.csv("data/encounter.csv")
 loitering <- read.csv("data/loitering.csv")
 port <- read.csv("data/port.csv")
@@ -28,13 +23,11 @@ saveRDS(df, file = "data/dataset.RDS")
 saveRDS(port, file = "data/port.RDS")
 
 
-choices <- sort(unique(rbind(encounter, loitering)$vessel.flag))
-saveRDS(choices, file = "data/flags.RDS")
-
-
+# Saving all ship IDs for the selection field
 save(list = c("ship_mmsi"), file = "data/ship_ids.Rdata")
 
 
+# Saving subtitle as RDS to read into UI
 subtitle <- paste0(
   "Illegal fishing is a major ecological and humanitarian problem. ",
   "This portal aims to provide details on some of the largest offenders",
@@ -58,28 +51,18 @@ saveRDS(HTML(subtitle),
 nato_countries <- read.csv(file = "data/nato_countries.csv")
 
 
-
+# Downloading EEZ data
 library(sp)
 library(rworldmap)
 library(rgeos)
-# 39.494828, -74.235441
-r <- data.frame(long = c(-74.235441, 39.494828, -178.311660375408,-176.511660375408, -174.711660375408, -172.911660375408, -171.111660375408,-169.311660375408), 
-               lat = c(39.494828, -74.235441, 73.1088933113454, 73.1088933113454,73.1088933113454, 73.1088933113454, 73.1088933113454, 73.1088933113454))
-
-# or
-#r <- data.frame(long = c(-178.311660375408,-176.511660375408, -174.711660375408, -172.911660375408, -171.111660375408,-169.311660375408), 
-#                lat = c(73.1088933113454, 73.1088933113454,73.1088933113454, 73.1088933113454, 73.1088933113454, 73.1088933113454))
-
 r.pts <- sp::SpatialPoints(r)
 
 # download file from here: http://www.marineregions.org/download_file.php?fn=v9_20161021
 # put the zip file in your working directory: getwd()
 unzip('data/World_EEZ_v9_20161021.zip')
 
-# countriesSP <- rworldmap::getMap(resolution = "high")
-# or
-countriesSP <- rgdal::readOGR(dsn = "World_EEZ_v9_20161021", layer = "eez_boundaries")
 
-r.pts <- sp::SpatialPoints(r.pts, proj4string = sp::CRS(proj4string(countriesSP))) 
-indices <- over(r.pts, countriesSP)
-indices$MRGID_Ter1
+# Filtering EEZ shapefile by only U.S. EEZ. Otherwise it takes too long to read in
+us_eezs <- sf::st_read("data/World_EEZ_v11_20191118/eez_v11.shp") %>%
+  filter(ISO_TER1 == "USA")
+saveRDS(us_eezs, file = "data/shapefiles_for_us_eez.RDS")
